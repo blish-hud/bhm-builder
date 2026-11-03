@@ -1,0 +1,111 @@
+# Runs untrusted code: never add secrets, caches or token permissions.
+name: build
+run-name: ${{ inputs.request_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      request_id:
+        description: SSRD's ID for this build, used to find the run
+        required: true
+      repo_url:
+        description: HTTPS clone URL, when the source is public
+        required: false
+      source_url:
+        description: Short-lived link to a zip of the source, when it is not public
+        required: false
+      sha:
+        description: Full commit SHA resolved by SSRD
+        required: true
+      manifest_path:
+        description: Path to manifest.json, relative to the repo root
+        required: true
+      runner:
+        description: Runner image
+        type: choice
+        default: windows-2022
+        options:
+          - windows-2022
+          - windows-2025-vs2026
+
+permissions: {}
+
+jobs:
+  build:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 15
+    steps:
+      - name: Build module
+        shell: pwsh
+        env:
+          REPO_URL: ${{ inputs.repo_url }}
+          SOURCE_URL: ${{ inputs.source_url }}
+          SOURCE_SHA: ${{ inputs.sha }}
+          MANIFEST_PATH: ${{ inputs.manifest_path }}
+          GIT_TERMINAL_PROMPT: "0"
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          if ($env:SOURCE_SHA -notmatch '^[0-9a-f]{40}$') { throw 'sha must be a full commit SHA' }
+          if (($env:REPO_URL + $env:SOURCE_URL) -notmatch '^https://') { throw 'repo_url or source_url must use https' }
+          if ($env:MANIFEST_PATH -match '(^|[\\/])\.\.([\\/]|$)' -or [IO.Path]::IsPathRooted($env:MANIFEST_PATH)) {
+            throw 'manifest_path must stay inside the repo'
+          }
+
+          New-Item -ItemType Directory out | Out-Null
+          $log = Join-Path $PWD 'out/build.log'
+
+          $PSNativeCommandUseErrorActionPreference = $true
+          git config --global core.longpaths true
+          git config --global protocol.file.allow never
+          git config --global protocol.ext.allow never
+          if ($env:SOURCE_URL) {
+            Invoke-WebRequest -Uri $env:SOURCE_URL -OutFile source.zip
+            New-Item -ItemType Directory src | Out-Null
+            # Git's tar comes first on PATH and can't read zip files
+            & "$env:SystemRoot/System32/tar.exe" -xf source.zip -C src --strip-components=1
+          } else {
+            git clone --quiet $env:REPO_URL src
+            git -C src checkout --quiet $env:SOURCE_SHA
+            git -C src submodule update --quiet --init --recursive
+          }
+          $PSNativeCommandUseErrorActionPreference = $false
+
+          $moduleDir = Split-Path (Join-Path $PWD 'src' $env:MANIFEST_PATH)
+          $slnDir = $moduleDir
+          if (-not (Get-ChildItem $moduleDir -Filter *.sln -File)) {
+            $parent = Split-Path $moduleDir
+            if (Get-ChildItem $parent -Filter *.sln -File) { $slnDir = $parent }
+          }
+
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
+          $msbuild = & $vswhere -latest -requires Microsoft.Component.MSBuild -find 'MSBuild/**/Bin/MSBuild.exe' | Select-Object -First 1
+
+          Push-Location $slnDir
+          nuget restore *>&1 | Tee-Object -FilePath $log -Append
+          Pop-Location
+
+          function Find-Bhm { @(Get-ChildItem $moduleDir -Filter *.bhm -File -Recurse) }
+
+          Push-Location $moduleDir
+          & $msbuild -nologo -nodeReuse:false -p:Configuration=Release *>&1 | Tee-Object -FilePath $log -Append
+          if (-not (Find-Bhm)) {
+            & $msbuild -nologo -nodeReuse:false -p:Configuration=Release *>&1 | Tee-Object -FilePath $log -Append
+          }
+          Pop-Location
+
+          $modules = Find-Bhm
+          if ($modules.Count -ne 1) { throw "expected 1 .bhm, found $($modules.Count)" }
+          Copy-Item $modules[0].FullName out/
+
+          # MSBuild can exit non-zero on stale solution entries after the .bhm is built
+          exit 0
+
+      - name: Upload output
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: build
+          path: out/
+          retention-days: 1
+          if-no-files-found: error
